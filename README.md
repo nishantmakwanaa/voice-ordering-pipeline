@@ -1,100 +1,115 @@
 # VoiceServe AI — Real-Time Voice Ordering Pipeline
 
-> **83% latency reduction** (12s → 1.5s) | Real-time STT→LLM→TTS pipeline | Multi-turn conversational AI for restaurant ordering
+> **Target latency profile:** 83% reduction (12s → 1.5s) via Redis caching & adaptive buffering | Real-time STT → LLM → TTS pipeline | Full-stack AI POS & Voice Ordering
+
+---
 
 ## Architecture
 
+```text
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                              VoiceServe AI                                   │
+│                                                                              │
+│  ┌────────────────────┐   WS /ws/voice/{id}   ┌───────────────────────────┐  │
+│  │  React 18 + Vite   │◄─────────────────────►│      FastAPI Backend      │  │
+│  │                    │                       │                           │  │
+│  │  • VoiceInterface  │   REST (/menu, /cart, │  ┌─────────────────────┐  │  │
+│  │  • MenuDisplay     │    /orders, /reports) │  │  VoiceAgent         │  │  │
+│  │  • CartDisplay     │◄─────────────────────►│  │  Saaras v3 (STT)    │  │  │
+│  │  • OrderHistory    │                       │  │    ▼                │  │  │
+│  └────────────────────┘                       │  │  Kimi K2 (LLM+Tools)│  │  │
+│                                               │  │    ▼                │  │  │
+│                                               │  │  Bulbul v3 (TTS)    │  │  │
+│                                               │  └──────────┬──────────┘  │  │
+│                                               │             │             │  │
+│                                               │  ┌──────────▼──────────┐  │  │
+│                                               │  │ Redis 7 | Pinecone  │  │  │
+│                                               │  │ PgSQL 15| FP-Growth │  │  │
+│                                               │  └─────────────────────┘  │  │
+│                                               └───────────────────────────┘  │
+└──────────────────────────────────────────────────────────────────────────────┘
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                        VoiceServe AI                                │
-│                                                                     │
-│  ┌──────────┐    WebSocket    ┌────────────────────────────────┐   │
-│  │  React   │◄──────────────►│         FastAPI Backend        │   │
-│  │ Frontend │                │                                │   │
-│  │          │   REST API     │  ┌──────────────────────────┐  │   │
-│  │  Voice   │◄──────────────►│  │     Voice Agent          │  │   │
-│  │Interface │                │  │  ┌────┐ ┌─────┐ ┌─────┐ │  │   │
-│  │  Menu    │                │  │  │STT │►│ LLM │►│ TTS │ │  │   │
-│  │  Cart    │                │  │  │v3  │ │ K2  │ │ v3  │ │  │   │
-│  └──────────┘                │  └────┘ └─────┘ └─────┘ │  │   │
-│                              │  └──────────────────────────┘  │   │
-│                              │                                │   │
-│                              │  ┌──────┐ ┌───────┐ ┌──────┐ │   │
-│                              │  │Redis │ │Pinecone│ │  DB  │ │   │
-│                              │  │Cache │ │Vector │ │ PgSQL│ │   │
-│                              │  └──────┘ └───────┘ └──────┘ │   │
-│                              └────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────────────┘
-```
 
-## Key Highlights
+### End-to-End Request Flow
+1. **Audio Capture & Streaming:** The React hook [`useVoiceSocket.js`](frontend/src/hooks/useVoiceSocket.js) streams 16 kHz PCM-16 audio chunks over WebSocket (`/ws/voice/{session_id}`).
+2. **STT & Adaptive Buffering ([`stt_service.py`](backend/services/stt_service.py)):** `AudioBuffer` applies RMS-based noise gating (`saaras_noise_threshold: 0.02`) and speech/silence detection before sending audio to **Saaras v3 STT**.
+3. **Tool-Calling Agent ([`voice_agent.py`](backend/agents/voice_agent.py), [`tools.py`](backend/agents/tools.py)):** **Kimi K2** (`kimi-k2-instruct`) processes multi-turn session history from Redis/PostgreSQL and executes structured tools (`search_menu`, `add_to_cart`, `remove_from_cart`, `get_cart`, `validate_order`, `checkout`, `get_recommendations`).
+4. **Streaming TTS & Interrupt Handling ([`tts_service.py`](backend/services/tts_service.py)):** **Bulbul v3** synthesizes `pcm_16000` audio chunks streamed back to the browser; `interrupt`, `pause`, and `resume` signals enable barge-in dialogue control.
 
-- 🎙️ **Real-time Voice Pipeline**: Saaras v3 STT → Kimi K2 LLM → Bulbul v3 TTS with sub-2s end-to-end latency
-- ⚡ **83% Latency Reduction**: Redis caching dropped average response from 12s to 1.5s
-- 🧠 **Multi-turn Context**: Stateful session memory across full conversation lifecycle
-- 🔍 **Fuzzy Menu Matching**: Pinecone vector search with semantic embeddings for natural language menu queries
-- 🛑 **Interrupt-Aware Dialogue**: Pause/resume capability with barge-in detection
-- 📊 **Smart Recommendations**: FP-Growth algorithm for association-rule based item suggestions
-- 🌐 **Multilingual Reporting**: Gemini-driven menu performance insights in multiple languages
-- 🐳 **Fully Dockerized**: One-command full-stack deployment
+---
 
-## Performance Metrics
+## Models & AI Services Used
 
-| Metric | Before | After | Improvement |
-|--------|--------|-------|-------------|
+| Component | Model / Algorithm | Purpose & How It Is Used | Implementation |
+| :--- | :--- | :--- | :--- |
+| **Speech-to-Text (STT)** | **Saaras v3** | Transcribes 16 kHz PCM audio after noise filtering and adaptive silence buffering | [`backend/services/stt_service.py`](backend/services/stt_service.py) |
+| **Conversational LLM** | **Kimi K2** (`kimi-k2-instruct`) | Multi-turn dialogue management (`32K` context) with OpenAI-style tool calling | [`backend/services/llm_service.py`](backend/services/llm_service.py) |
+| **Text-to-Speech (TTS)** | **Bulbul v3** (`pcm_16000`) | Streams synthesized voice responses chunk-by-chunk over WebSocket | [`backend/services/tts_service.py`](backend/services/tts_service.py) |
+| **Semantic Menu Search** | `text-embedding-3-small` (`1536`-dim) + **Pinecone** | Embeds menu items and natural-language queries for cosine-similarity fuzzy matching | [`backend/services/vector_service.py`](backend/services/vector_service.py) |
+| **Smart Recommendations** | **FP-Growth** (`mlxtend`) | Mines association rules (`min_support=0.05`, `min_confidence=0.3`) from completed orders | [`backend/services/recommendation_service.py`](backend/services/recommendation_service.py) |
+| **Multilingual Reporting** | **Google Gemini** (`gemini-1.5-pro`) | Generates natural-language sales/menu performance reports (with deterministic fallback) | [`backend/routers/reports.py`](backend/routers/reports.py) |
+
+---
+
+## Data Sources, Schema & Seeding
+
+This application uses **operational restaurant POS & order-history data** stored in **PostgreSQL 15**, cached in **Redis 7**, and indexed in **Pinecone** (no external static ML dataset is required):
+
+- **Database Schema ([`migrations/001_initial.sql`](migrations/001_initial.sql), [`backend/models/database.py`](backend/models/database.py)):**
+  - `menu_items`: Restaurant catalog (name, description, price, category, tags, calories, allergens, prep time, availability).
+  - `voice_sessions`: Active conversation history, state (`active`, `paused`, `completed`), and customer metadata.
+  - `cart_items` & `orders` / `order_items`: Real-time cart state and confirmed POS orders.
+- **Seed Data ([`scripts/seed_menu.py`](scripts/seed_menu.py)):**
+  - Populates **15 sample restaurant menu items** (burgers, wraps, sides, beverages, desserts) and **20 historical order baskets** so the **FP-Growth** recommender and Pinecone index can be initialized immediately out of the box.
+- **Caching Layer ([`backend/services/cache_service.py`](backend/services/cache_service.py)):**
+  - Preloads menu items (`TTL 3600s`), stores session state (`TTL 1800s`), and caches recommendation outputs (`TTL 900s`).
+
+---
+
+## Design Benchmark Targets
+
+Project performance targets from the system design specification (requires live external API keys for Saaras v3, Kimi K2, Bulbul v3, Pinecone, and Gemini to benchmark end-to-end):
+
+| Metric | Baseline | Target | Improvement |
+| :--- | :---: | :---: | :---: |
 | Average Response Latency | 12s | 1.5s | **83% ↓** |
 | Menu Query Cache Hit Rate | — | 94% | — |
-| STT Word Error Rate | — | <5% | — |
 | Order Accuracy | 71% | 96% | **35% ↑** |
 | Concurrent Sessions | 5 | 150+ | **30x ↑** |
 
-## Tech Stack
-
-| Layer | Technology |
-|-------|-----------|
-| **STT** | Saaras v3 (noise filtering, adaptive buffering) |
-| **LLM** | Kimi K2 (tool calling, multi-turn context) |
-| **TTS** | Bulbul v3 (streaming audio synthesis) |
-| **Backend** | FastAPI (async WebSocket + REST) |
-| **Frontend** | React 18 (Vite, waveform visualization) |
-| **Database** | PostgreSQL 15 (SQLAlchemy async) |
-| **Cache** | Redis 7 (session state, menu preloading) |
-| **Vector DB** | Pinecone (semantic menu embeddings) |
-| **Recommendations** | FP-Growth (mlxtend) |
-| **Reporting** | Google Gemini API |
-| **Infra** | Docker Compose |
+---
 
 ## Repository Structure
 
-```
+```text
 voice-ordering-pipeline/
 ├── backend/
 │   ├── agents/
 │   │   ├── __init__.py
-│   │   ├── voice_agent.py      # Main STT→LLM→TTS orchestrator
-│   │   └── tools.py            # LLM tool definitions
+│   │   ├── voice_agent.py      # STT → LLM (tool loop) → TTS orchestrator
+│   │   └── tools.py            # Menu, cart, validation, checkout & recommender tools
 │   ├── models/
 │   │   ├── __init__.py
 │   │   ├── database.py         # SQLAlchemy ORM models
-│   │   └── schemas.py          # Pydantic request/response schemas
+│   │   └── schemas.py          # Pydantic request/response/WS schemas
 │   ├── routers/
 │   │   ├── __init__.py
-│   │   ├── menu.py             # Menu CRUD endpoints
-│   │   ├── orders.py           # Order management
-│   │   ├── voice.py            # Voice WebSocket endpoint
-│   │   └── reports.py          # Gemini reporting endpoints
+│   │   ├── menu.py             # Menu CRUD & semantic search endpoints
+│   │   ├── orders.py           # Order & cart management + recommendations
+│   │   ├── voice.py            # WebSocket /ws/voice/{session_id}
+│   │   └── reports.py          # Sales analytics & Gemini multilingual reporting
 │   ├── services/
 │   │   ├── __init__.py
-│   │   ├── stt_service.py      # Saaras v3 STT integration
-│   │   ├── llm_service.py      # Kimi K2 LLM integration
-│   │   ├── tts_service.py      # Bulbul v3 TTS integration
-│   │   ├── cache_service.py    # Redis caching
-│   │   ├── vector_service.py   # Pinecone vector search
-│   │   └── recommendation_service.py  # FP-Growth recommendations
+│   │   ├── stt_service.py      # Saaras v3 STT + noise filter + AudioBuffer
+│   │   ├── llm_service.py      # Kimi K2 LLM client + tool calling
+│   │   ├── tts_service.py      # Bulbul v3 streaming TTS client
+│   │   ├── cache_service.py    # Redis caching & preloading
+│   │   ├── vector_service.py   # Pinecone semantic menu search
+│   │   └── recommendation_service.py  # mlxtend FP-Growth recommender
 │   ├── __init__.py
-│   ├── config.py               # Pydantic settings
-│   ├── database.py             # Async DB connection
-│   └── main.py                 # FastAPI application entry point
+│   ├── config.py               # Pydantic settings (.env)
+│   ├── database.py             # Async PostgreSQL engine & sessions
+│   └── main.py                 # FastAPI app & lifespan initialization
 ├── frontend/
 │   ├── src/
 │   │   ├── components/
@@ -113,16 +128,19 @@ voice-ordering-pipeline/
 │   ├── package.json
 │   └── vite.config.js
 ├── migrations/
-│   └── 001_initial.sql
+│   └── 001_initial.sql         # Initial PostgreSQL schema
 ├── scripts/
-│   └── seed_menu.py
+│   └── seed_menu.py            # Seeds 15 menu items + 20 historical baskets
 ├── docker-compose.yml
 ├── Dockerfile.backend
 ├── .env.example
 ├── .gitignore
 ├── requirements.txt
+├── LICENSE
 └── README.md
 ```
+
+---
 
 ## Quick Start
 
@@ -130,153 +148,64 @@ voice-ordering-pipeline/
 
 ```bash
 # 1. Clone the repository
-git clone https://github.com/your-org/voice-ordering-pipeline.git
+git clone https://github.com/nishantmakwanaa/voice-ordering-pipeline.git
 cd voice-ordering-pipeline
 
-# 2. Copy environment variables
+# 2. Configure environment variables
 cp .env.example .env
-# Edit .env with your API keys
+# Edit .env with your API keys (SAARAS_API_KEY, KIMI_API_KEY, BULBUL_API_KEY, PINECONE_API_KEY, GEMINI_API_KEY)
 
-# 3. Start the full stack
+# 3. Start PostgreSQL, Redis, FastAPI backend, and React frontend
 docker compose up --build
 
-# 4. Seed the menu database
+# 4. Seed the menu & historical order baskets (in another terminal)
 docker compose exec backend python scripts/seed_menu.py
 
 # 5. Open the app
-open http://localhost:3000
+# Frontend: http://localhost:3000 | API Docs: http://localhost:8000/docs
 ```
 
 ### Manual Setup
 
-#### Prerequisites
-- Python 3.11+
-- Node.js 18+
-- PostgreSQL 15+
-- Redis 7+
-
-#### Backend
+#### Backend (`Python 3.11+`, `PostgreSQL 15+`, `Redis 7+`)
 
 ```bash
 python -m venv venv
 source venv/bin/activate  # Windows: venv\Scripts\activate
-
 pip install -r requirements.txt
-
-# Set environment variables (copy from .env.example)
 cp .env.example .env
 
-# Run database migrations
 psql -U voiceserve -d voiceserve -f migrations/001_initial.sql
-
-# Seed sample menu & order history
 python scripts/seed_menu.py
-
-# Start the backend from the repository root
 uvicorn backend.main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-#### Frontend
+#### Frontend (`Node.js 18+`)
 
 ```bash
 cd frontend
 npm install
 npm run dev
-# Open http://localhost:3000
 ```
 
-## API Documentation
+---
 
-Interactive docs available at `http://localhost:8000/docs` (Swagger UI) and `http://localhost:8000/redoc`.
+## API & WebSocket Reference
 
-### Core Endpoints
+Interactive Swagger docs are served at `http://localhost:8000/docs`.
 
 | Method | Path | Description |
-|--------|------|-------------|
+| :--- | :--- | :--- |
 | `GET` | `/health` | Service health check |
-| `WS` | `/ws/voice/{session_id}` | Voice streaming WebSocket |
-| `GET` | `/menu` | List all menu items |
-| `GET` | `/menu/search` | Semantic / keyword menu search |
-| `GET` | `/menu/{item_id}` | Get menu item details |
-| `POST` | `/menu` | Create menu item (admin) |
-| `PUT` | `/menu/{item_id}` | Update menu item (admin) |
-| `DELETE` | `/menu/{item_id}` | Delete menu item (admin) |
-| `GET` | `/orders` | List orders |
-| `GET` | `/orders/{order_id}` | Get order details |
-| `POST` | `/orders` | Create order |
-| `PUT` | `/orders/{order_id}/status` | Update order status |
-| `GET` | `/cart/{session_id}` | Get session cart |
-| `POST` | `/cart/{session_id}/add` | Add item to cart |
-| `DELETE` | `/cart/{session_id}/item/{item_id}` | Remove from cart |
-| `POST` | `/cart/{session_id}/checkout` | Checkout cart |
-| `GET` | `/recommendations/{session_id}` | Get personalized recommendations |
-| `GET` | `/reports/menu-performance` | Menu performance report |
-| `GET` | `/reports/sales-summary` | Sales summary report |
-| `POST` | `/reports/generate` | Generate Gemini AI report |
+| `WS` | `/ws/voice/{session_id}` | Real-time voice streaming WebSocket |
+| `GET` / `POST` | `/menu`, `/menu/{item_id}` | Menu listing & admin CRUD |
+| `GET` | `/menu/search` | Semantic (Pinecone) / keyword menu search |
+| `GET` / `POST` / `PUT` | `/orders`, `/orders/{order_id}`, `/orders/{order_id}/status` | Order management |
+| `GET` / `POST` / `DELETE` | `/cart/{session_id}`, `/cart/{session_id}/add`, `/cart/{session_id}/checkout` | Session cart & checkout |
+| `GET` | `/recommendations/{session_id}` | FP-Growth smart item suggestions |
+| `GET` / `POST` | `/reports/menu-performance`, `/reports/sales-summary`, `/reports/generate` | Sales metrics & Gemini AI report |
 
-### WebSocket Protocol
-
-```json
-// Client → Server: audio chunk
-{ "type": "audio_chunk", "data": "<base64-encoded PCM audio>" }
-
-// Client → Server: interrupt signal
-{ "type": "interrupt" }
-
-// Client → Server: pause / resume TTS playback
-{ "type": "pause" }
-{ "type": "resume" }
-
-// Client → Server: end of utterance
-{ "type": "end_of_speech" }
-
-// Client → Server: text input fallback
-{ "type": "text_input", "text": "I'd like a burger" }
-
-// Server → Client: transcript
-{ "type": "transcript", "text": "I'd like a burger", "is_final": true }
-
-// Server → Client: LLM response
-{ "type": "llm_response", "text": "Great choice! Adding a burger to your cart." }
-
-// Server → Client: TTS audio chunk
-{ "type": "tts_audio", "data": "<base64-encoded audio>", "is_final": false }
-
-// Server → Client: cart update
-{ "type": "cart_update", "cart": { ... } }
-
-// Server → Client: error
-{ "type": "error", "message": "..." }
-```
-
-## Configuration
-
-All configuration is done via environment variables. See `.env.example` for the full list.
-
-### Key Variables
-
-| Variable | Description |
-|----------|-------------|
-| `DATABASE_URL` | PostgreSQL async connection string |
-| `REDIS_URL` | Redis connection string |
-| `SAARAS_API_KEY` | Saaras v3 STT API key |
-| `SAARAS_API_URL` | Saaras v3 API base URL |
-| `KIMI_API_KEY` | Kimi K2 LLM API key |
-| `KIMI_API_URL` | Kimi K2 API base URL |
-| `BULBUL_API_KEY` | Bulbul v3 TTS API key |
-| `BULBUL_API_URL` | Bulbul v3 API base URL |
-| `PINECONE_API_KEY` | Pinecone vector DB API key |
-| `PINECONE_INDEX_NAME` | Pinecone index name |
-| `GEMINI_API_KEY` | Google Gemini API key (for reporting) |
-| `SECRET_KEY` | App secret key for session signing |
-
-## Contributing
-
-1. Fork the repository
-2. Create your feature branch (`git checkout -b feature/my-feature`)
-3. Commit your changes (`git commit -m 'Add my feature'`)
-4. Push to the branch (`git push origin feature/my-feature`)
-5. Open a Pull Request
+---
 
 ## License
 
